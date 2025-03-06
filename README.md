@@ -2,6 +2,109 @@
 
 This is a Node.js Express application that connects to SharePoint using Azure AD authentication to fetch and download files.
 
+## API Documentation
+
+### 1. Health Check
+Verify if the application is running.
+
+```bash
+curl http://localhost:3000/
+```
+
+### 2. List Files (Root)
+Get all files from the root of the SharePoint site.
+
+```bash
+curl http://localhost:3000/files
+```
+
+### 3. Download Specific File
+Download a specific file by its name.
+
+```bash
+curl http://localhost:3000/download/example.pdf > example.pdf
+```
+
+### 4. List Folder Contents
+List all files and folders in a specific path. The path parameter is optional.
+
+```bash
+# List root contents
+curl http://localhost:3000/list
+
+# List specific folder
+curl http://localhost:3000/list/Documents
+
+# List nested folder
+curl http://localhost:3000/list/Documents/Reports
+```
+
+Response format:
+```json
+{
+  "currentPath": "Documents/Reports",
+  "items": [
+    {
+      "name": "example.pdf",
+      "type": "file",
+      "path": "Documents/Reports/example.pdf",
+      "lastModified": "2023-01-01T00:00:00Z",
+      "size": 1234567,
+      "webUrl": "https://sharepoint.com/path/to/file",
+      "mimeType": "application/pdf",
+      "downloadUrl": "https://...."
+    },
+    {
+      "name": "SubFolder",
+      "type": "folder",
+      "path": "Documents/Reports/SubFolder",
+      "lastModified": "2023-01-01T00:00:00Z",
+      "size": 0,
+      "webUrl": "https://sharepoint.com/path/to/folder",
+      "childCount": 5
+    }
+  ]
+}
+```
+
+### 5. Download Folder Contents
+Download all files from a folder recursively to either local storage or Azure Blob Storage.
+
+#### a. Download to Local Storage
+```bash
+curl -X POST http://localhost:3000/download-folder \
+  -H "Content-Type: application/json" \
+  -d '{
+    "folderPath": "Documents/Reports",
+    "destination": "local"
+  }'
+```
+
+#### b. Upload to Azure Blob Storage
+```bash
+curl -X POST http://localhost:3000/download-folder \
+  -H "Content-Type: application/json" \
+  -d '{
+    "folderPath": "Documents/Reports",
+    "destination": "blob"
+  }'
+```
+
+Response format:
+```json
+{
+  "status": "success",
+  "totalFiles": 10,
+  "files": [
+    {
+      "file": "Documents/Reports/example.pdf",
+      "status": "success",
+      "destination": "/local/path/or/blob/url"
+    }
+  ]
+}
+```
+
 ## Prerequisites
 
 1. Node.js installed on your machine
