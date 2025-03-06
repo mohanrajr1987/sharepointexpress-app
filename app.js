@@ -88,6 +88,38 @@ app.get('/download/:filename', async (req, res) => {
     }
 });
 
+// Helper function to get all drives in the site
+async function getAllDrives(site) {
+    try {
+        const drives = await graphClient
+            .api(`/sites/${site.id}/drives`)
+            .get();
+        return drives.value;
+    } catch (error) {
+        console.error('Error getting drives:', error);
+        return [];
+    }
+}
+
+// Helper function to get items from a specific drive and path
+async function getItemsFromDrive(driveId, folderPath) {
+    try {
+        const apiPath = folderPath
+            ? `/drives/${driveId}/root:/${folderPath}:/children`
+            : `/drives/${driveId}/root/children`;
+
+        const items = await graphClient
+            .api(apiPath)
+            .expand('folder,file')
+            .get();
+
+        return items.value;
+    } catch (error) {
+        console.error(`Error getting items from drive ${driveId}:`, error);
+        return [];
+    }
+}
+
 // Endpoint to list all folders and files recursively
 app.get('/list/*', async (req, res) => {
     try {
@@ -100,35 +132,58 @@ app.get('/list/*', async (req, res) => {
             .api(`/sites/${hostname}:${sitePath}`)
             .get();
 
+        // Get all drives in the site
+        const drives = await getAllDrives(site);
+        
         // Get the folder path from the URL
         const folderPath = req.params[0] || '';
-        const apiPath = folderPath ? `/sites/${site.id}/drive/root:/${folderPath}:/children` 
-                                 : `/sites/${site.id}/drive/root/children`;
+        
+        let allItems = [];
+        
+        // Get items from all drives
+        for (const drive of drives) {
+            const items = await getItemsFromDrive(drive.id, folderPath);
+            
+            // Process items from this drive
+            const processedItems = items.map(item => ({
+                name: item.name,
+                type: item.folder ? 'folder' : 'file',
+                path: folderPath ? `${folderPath}/${item.name}` : item.name,
+                lastModified: item.lastModifiedDateTime,
+                size: item.size,
+                webUrl: item.webUrl,
+                driveId: drive.id,
+                driveName: drive.name,
+                ...(item.folder && { 
+                    childCount: item.folder.childCount,
+                    isFolder: true
+                }),
+                ...(item.file && { 
+                    mimeType: item.file.mimeType,
+                    downloadUrl: item['@microsoft.graph.downloadUrl'],
+                    isFile: true
+                })
+            }));
+            
+            allItems = allItems.concat(processedItems);
+        }
 
-        // Get items from the specified folder
-        const items = await graphClient
-            .api(apiPath)
-            .expand('folder,file')
-            .get();
-
-        // Process and structure the response
-        const processedItems = items.value.map(item => ({
-            name: item.name,
-            type: item.folder ? 'folder' : 'file',
-            path: folderPath ? `${folderPath}/${item.name}` : item.name,
-            lastModified: item.lastModifiedDateTime,
-            size: item.size,
-            webUrl: item.webUrl,
-            ...(item.folder && { childCount: item.folder.childCount }),
-            ...(item.file && { 
-                mimeType: item.file.mimeType,
-                downloadUrl: item['@microsoft.graph.downloadUrl']
-            })
-        }));
+        // Sort items: folders first, then files, both alphabetically
+        allItems.sort((a, b) => {
+            if (a.type === b.type) {
+                return a.name.localeCompare(b.name);
+            }
+            return a.type === 'folder' ? -1 : 1;
+        });
 
         res.json({
             currentPath: folderPath || 'root',
-            items: processedItems
+            drives: drives.map(drive => ({
+                id: drive.id,
+                name: drive.name,
+                webUrl: drive.webUrl
+            })),
+            items: allItems
         });
     } catch (error) {
         console.error('Error listing items:', error);
