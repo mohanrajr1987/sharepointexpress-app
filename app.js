@@ -301,6 +301,255 @@ app.post('/download-folder', async (req, res) => {
     }
 });
 
+// Helper function to list files in local storage
+async function listLocalFiles(basePath) {
+    try {
+        await fs.ensureDir(basePath);
+        const items = [];
+
+        async function scanDirectory(currentPath, relativePath = '') {
+            const entries = await fs.readdir(currentPath, { withFileTypes: true });
+
+            for (const entry of entries) {
+                const fullPath = path.join(currentPath, entry.name);
+                const relativeName = relativePath ? path.join(relativePath, entry.name) : entry.name;
+
+                if (entry.isDirectory()) {
+                    await scanDirectory(fullPath, relativeName);
+                } else {
+                    const stats = await fs.stat(fullPath);
+                    items.push({
+                        name: entry.name,
+                        path: relativeName,
+                        size: stats.size,
+                        lastModified: stats.mtime,
+                        type: 'local',
+                        fullPath: fullPath
+                    });
+                }
+            }
+        }
+
+        await scanDirectory(basePath);
+        return items;
+    } catch (error) {
+        console.error('Error listing local files:', error);
+        return [];
+    }
+}
+
+// Helper function to list files in blob storage
+async function listBlobFiles() {
+    try {
+        const blobServiceClient = BlobServiceClient.fromConnectionString(
+            process.env.AZURE_STORAGE_CONNECTION_STRING
+        );
+        const containerClient = blobServiceClient.getContainerClient(
+            process.env.AZURE_STORAGE_CONTAINER_NAME
+        );
+
+        const items = [];
+        for await (const blob of containerClient.listBlobsFlat()) {
+            const blobClient = containerClient.getBlobClient(blob.name);
+            items.push({
+                name: path.basename(blob.name),
+                path: blob.name,
+                size: blob.properties.contentLength,
+                lastModified: blob.properties.lastModified,
+                type: 'blob',
+                url: blobClient.url,
+                contentType: blob.properties.contentType
+            });
+        }
+        return items;
+    } catch (error) {
+        console.error('Error listing blob files:', error);
+        return [];
+    }
+}
+
+// Endpoint to list downloaded files
+app.get('/downloads', async (req, res) => {
+    try {
+        const { type = 'all' } = req.query;
+        let files = [];
+
+        if (type === 'all' || type === 'local') {
+            const localFiles = await listLocalFiles(process.env.LOCAL_DOWNLOAD_PATH);
+            files = files.concat(localFiles);
+        }
+
+        if (type === 'all' || type === 'blob') {
+            const blobFiles = await listBlobFiles();
+            files = files.concat(blobFiles);
+        }
+
+        // Sort files by last modified date (newest first)
+        files.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+
+        // Group files by storage type
+        const groupedFiles = files.reduce((acc, file) => {
+            const storageType = file.type;
+            if (!acc[storageType]) {
+                acc[storageType] = [];
+            }
+            acc[storageType].push(file);
+            return acc;
+        }, {});
+
+        res.json({
+            totalFiles: files.length,
+            storageTypes: Object.keys(groupedFiles),
+            files: groupedFiles
+        });
+    } catch (error) {
+        console.error('Error listing downloaded files:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Helper function to match file patterns
+function matchFilePattern(filename, patterns) {
+    if (!patterns || patterns.length === 0) return true;
+    return patterns.some(pattern => {
+        // Convert wildcard pattern to regex
+        const regexPattern = pattern
+            .replace(/\./g, '\\.')
+            .replace(/\*/g, '.*')
+            .replace(/\?/g, '.');
+        return new RegExp(`^${regexPattern}$`).test(filename);
+    });
+}
+
+// Helper function to check file modification date
+function isFileInDateRange(lastModified, dateRange) {
+    if (!dateRange) return true;
+    const fileDate = new Date(lastModified);
+    if (dateRange.from && new Date(dateRange.from) > fileDate) return false;
+    if (dateRange.to && new Date(dateRange.to) < fileDate) return false;
+    return true;
+}
+
+// Endpoint to fetch and upload specific files
+app.post('/fetch-files', async (req, res) => {
+    try {
+        const {
+            sourcePath = '',           // SharePoint folder path
+            destination = 'local',     // 'local' or 'blob'
+            filePatterns = [],         // Array of file patterns (e.g., ['*.pdf', 'doc*.docx'])
+            recursive = false,         // Whether to search in subfolders
+            dateRange = null,          // { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
+            preserveFolderStructure = true  // Maintain folder structure in destination
+        } = req.body;
+
+        const siteUrl = new URL(process.env.SHAREPOINT_SITE_URL);
+        const hostname = siteUrl.hostname;
+        const sitePath = siteUrl.pathname;
+
+        // Get the SharePoint site ID
+        const site = await graphClient
+            .api(`/sites/${hostname}:${sitePath}`)
+            .get();
+
+        // Function to recursively get all matching items
+        async function getAllItems(currentPath) {
+            const apiPath = currentPath
+                ? `/sites/${site.id}/drive/root:/${currentPath}:/children`
+                : `/sites/${site.id}/drive/root/children`;
+
+            const items = await graphClient
+                .api(apiPath)
+                .expand('folder,file')
+                .get();
+
+            let matchingItems = [];
+
+            for (const item of items.value) {
+                const itemPath = currentPath ? `${currentPath}/${item.name}` : item.name;
+
+                if (item.folder && recursive) {
+                    const subItems = await getAllItems(itemPath);
+                    matchingItems = matchingItems.concat(subItems);
+                } else if (item.file) {
+                    if (matchFilePattern(item.name, filePatterns) &&
+                        isFileInDateRange(item.lastModifiedDateTime, dateRange)) {
+                        matchingItems.push({
+                            name: item.name,
+                            path: itemPath,
+                            downloadUrl: item['@microsoft.graph.downloadUrl'],
+                            lastModified: item.lastModifiedDateTime,
+                            size: item.size,
+                            mimeType: item.file.mimeType
+                        });
+                    }
+                }
+            }
+
+            return matchingItems;
+        }
+
+        const matchingFiles = await getAllItems(sourcePath);
+        const results = [];
+
+        if (destination === 'blob') {
+            // Upload to Azure Blob Storage
+            const blobServiceClient = BlobServiceClient.fromConnectionString(
+                process.env.AZURE_STORAGE_CONNECTION_STRING
+            );
+            const containerClient = blobServiceClient.getContainerClient(
+                process.env.AZURE_STORAGE_CONTAINER_NAME
+            );
+
+            for (const file of matchingFiles) {
+                const blobPath = preserveFolderStructure ? file.path : file.name;
+                const blobClient = containerClient.getBlockBlobClient(blobPath);
+                const blobUrl = await uploadToBlob(blobClient, file.downloadUrl);
+                results.push({
+                    file: file.path,
+                    status: 'success',
+                    destination: blobUrl,
+                    size: file.size,
+                    lastModified: file.lastModified
+                });
+            }
+        } else {
+            // Download to local path
+            const basePath = process.env.LOCAL_DOWNLOAD_PATH;
+            await fs.ensureDir(basePath);
+
+            for (const file of matchingFiles) {
+                const localPath = path.join(
+                    basePath,
+                    preserveFolderStructure ? file.path : file.name
+                );
+                await downloadToLocal(file.downloadUrl, localPath);
+                results.push({
+                    file: file.path,
+                    status: 'success',
+                    destination: localPath,
+                    size: file.size,
+                    lastModified: file.lastModified
+                });
+            }
+        }
+
+        res.json({
+            status: 'success',
+            totalFiles: results.length,
+            sourcePath,
+            destination,
+            filePatterns,
+            recursive,
+            dateRange,
+            preserveFolderStructure,
+            files: results
+        });
+    } catch (error) {
+        console.error('Error fetching and uploading files:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
